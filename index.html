@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>睡眠音量レコーダー</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: sans-serif; margin: 16px; background: #f7f9fa; color: #333; }
+    button { padding: 12px 20px; font-size: 16px; font-weight: bold; border-radius: 8px; border: none; cursor: pointer; }
+    #startBtn { background: #007aff; color: white; }
+    #stopBtn { background: #ff3b30; color: white; display: none; }
+    #status { margin: 12px 0; font-size: 14px; color: #666; }
+    #chart-container { position: relative; width: 100%; height: 320px; margin-top: 20px; display: none; }
+    audio { width: 100%; margin-top: 16px; display: none; }
+    /* 録音中の省電力・防眩ブラックアウト画面 */
+    #overlay {
+      display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      background: black; color: #444; z-index: 9999; text-align: center; padding-top: 40vh;
+    }
+  </style>
+</head>
+<body>
+
+  <h2>睡眠音量レコーダー</h2>
+  <div id="status">マイクを許可して開始してください</div>
+  <button id="startBtn">録音開始</button>
+  <button id="stopBtn">録音停止・解析表示</button>
+
+  <div id="overlay">
+    <p>録音中（スリープ防止中）</p>
+    <p style="font-size: 12px;">画面をタップすると停止ボタンに戻ります</p>
+  </div>
+
+  <audio id="player" controls></audio>
+  <div id="chart-container">
+    <canvas id="volChart"></canvas>
+  </div>
+
+  <script>
+    let mediaRecorder;
+    let audioChunks = [];
+    let audioContext, analyser, dataArray;
+    let volumeHistory = []; // 1秒ごとの音量(dB)
+    let recordInterval;
+    let wakeLock = null;
+    let chartInstance = null;
+
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const statusText = document.getElementById('status');
+    const player = document.getElementById('player');
+    const overlay = document.getElementById('overlay');
+    const chartContainer = document.getElementById('chart-container');
+
+    // 画面タップでブラックアウト解除
+    overlay.onclick = () => { overlay.style.display = 'none'; };
+
+    startBtn.onclick = async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+
+        // スリープ防止
+        if ('wakeLock' in navigator) {
+          wakeLock = await navigator.wakeLock.request('screen');
+        }
+
+        // Web Audio API で音量解析のセットアップ
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        const source = audioContext.createMediaStreamSource(stream);
+        analyser = audioContext.createAnalyser();
+        analyser.fftSize = 512;
+        source.connect(analyser);
+        dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+        // 録音のセットアップ（軽量なOpus/AAC形式）
+        const mime = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/mp4';
+        mediaRecorder = new MediaRecorder(stream, { mimeType: mime });
+        audioChunks = [];
+        volumeHistory = [];
+
+        mediaRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
+        mediaRecorder.start(10000); // 10秒ごとにチャンク分割（メモリ安定化）
+
+        // 1秒ごとに音量(RMS -> dBFS換算)を記録
+        const startTime = Date.now();
+        recordInterval = setInterval(() => {
+          analyser.getByteTimeDomainData(dataArray);
+          let sumSquares = 0;
+          for (let i = 0; i < dataArray.length; i++) {
+            const norm = (dataArray[i] - 128) / 128; // -1.0 ~ 1.0 に正規化
+            sumSquares += norm * norm;
+          }
+          const rms = Math.sqrt(sumSquares / dataArray.length);
+          // デシベル変換（無音対策にフロアを設ける）
+          const db = rms > 0 ? Math.max(-80, 20 * Math.log10(rms)) : -80;
+          volumeHistory.push(Math.round(db));
+        }, 1000);
+
+        startBtn.style.display = 'none';
+        stopBtn.style.display = 'inline-block';
+        overlay.style.display = 'block';
+        statusText.textContent = '録音中...';
+
+      } catch (err) {
+        alert('マイクへのアクセスまたはWakeLockに失敗しました: ' + err.message);
+      }
+    };
+
+    stopBtn.onclick = () => {
+      clearInterval(recordInterval);
+      mediaRecorder.stop();
+      if (wakeLock) wakeLock.release();
+
+      mediaRecorder.onstop = () => {
+        const audioBlob = new Blob(audioChunks, { type: mediaRecorder.mimeType });
+        player.src = URL.createObjectURL(audioBlob);
+        player.style.display = 'block';
+        chartContainer.style.display = 'block';
+        statusText.textContent = 'グラフ上の山（物音）をタップすると該当秒数にジャンプします。';
+
+        stopBtn.style.display = 'none';
+        renderChart();
+      };
+    };
+
+    function renderChart() {
+      const ctx = document.getElementById('volChart').getContext('2d');
+      const labels = volumeHistory.map((_, i) => {
+        const h = String(Math.floor(i / 3600)).padStart(2, '0');
+        const m = String(Math.floor((i % 3600) / 60)).padStart(2, '0');
+        const s = String(i % 60).padStart(2, '0');
+        return `${h}:${m}:${s}`;
+      });
+
+      if (chartInstance) chartInstance.destroy();
+
+      chartInstance = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: labels,
+          datasets: [{
+            label: '音量 (dBFS)',
+            data: volumeHistory,
+            borderColor: '#007aff',
+            borderWidth: 1.5,
+            pointRadius: 0,
+            pointHitRadius: 10,
+            fill: false
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          scales: {
+            y: { min: -80, max: 0, title: { display: true, text: 'dBFS' } },
+            x: { ticks: { maxTicksLimit: 8 } }
+          },
+          // グラフタップ時に該当秒数へシーク
+          onClick: (evt, activeElements) => {
+            if (activeElements.length > 0) {
+              const clickedIndex = activeElements[0].index;
+              player.currentTime = clickedIndex;
+              player.play();
+            }
+          }
+        }
+      });
+    }
+  </script>
+</body>
+</html>
