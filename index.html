@@ -15,7 +15,7 @@
     audio { width: 100%; margin-top: 16px; display: none; }
     #overlay {
       display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-      background: black; color: #666; z-index: 9999; text-align: center; padding-top: 40vh;
+      background: black; color: #888; z-index: 9999; text-align: center; padding-top: 40vh;
     }
   </style>
 </head>
@@ -24,11 +24,11 @@
   <h2>睡眠音量レコーダー</h2>
   <div id="status">マイクを許可して開始してください</div>
   <button id="startBtn">録音開始</button>
-  <button id="stopBtn">録音停止・解析表示</button>
+  <button id="stopBtn">録音停止・グラフ表示</button>
 
   <div id="overlay">
     <p style="color:#aaa;">録音中（スリープ防止中）</p>
-    <p style="font-size: 12px; color:#666;">画面をタップすると操作画面に戻ります</p>
+    <p style="font-size: 12px; color:#666;">画面タップで停止画面に戻ります</p>
   </div>
 
   <audio id="player" controls playsinline></audio>
@@ -43,7 +43,7 @@
     let volumeHistory = [];
     let recordTimer = null;
     let animId = null;
-    let currentPeak = -100;
+    let currentPeak = 0;
     let wakeLock = null;
     let chartInstance = null;
 
@@ -62,12 +62,10 @@
           audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } 
         });
 
-        // スリープ防止
         if ('wakeLock' in navigator) {
           try { wakeLock = await navigator.wakeLock.request('screen'); } catch(e){}
         }
 
-        // iOS Safari対策: AudioContextの明示的起動
         audioContext = new (window.AudioContext || window.webkitAudioContext)();
         if (audioContext.state === 'suspended') {
           await audioContext.resume();
@@ -80,17 +78,16 @@
 
         dataArray = new Uint8Array(analyser.frequencyBinCount);
 
-        // 録音設定
         const mime = MediaRecorder.isTypeSupported('audio/mp4') ? 'audio/mp4' : 'audio/webm';
         mediaRecorder = new MediaRecorder(stream, { mimeType: mime });
         audioChunks = [];
         volumeHistory = [];
-        currentPeak = -100;
+        currentPeak = 0;
 
         mediaRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
         mediaRecorder.start(5000);
 
-        // 常時音量を監視（毎フレーム最大値を追跡）
+        // 常時音量を監視（0〜100の直感的なスコアに換算）
         function trackVolume() {
           analyser.getByteFrequencyData(dataArray);
           let sum = 0;
@@ -98,19 +95,19 @@
             sum += dataArray[i];
           }
           const avg = sum / dataArray.length;
-          // 0〜255の値をデシベル風（-80dB〜0dB）にスケーリング
-          const db = avg > 0 ? Math.round((avg / 255) * 80 - 80) : -80;
-          if (db > currentPeak) {
-            currentPeak = db;
+          // 0〜255の入力を 0〜100 の音量レベルに換算
+          const level = Math.min(100, Math.round((avg / 128) * 100));
+          if (level > currentPeak) {
+            currentPeak = level;
           }
           animId = requestAnimationFrame(trackVolume);
         }
         trackVolume();
 
-        // 1秒ごとにその1秒間の最大ピーク音量を記録
+        // 1秒ごとの最大ピークを記録
         recordTimer = setInterval(() => {
           volumeHistory.push(currentPeak);
-          currentPeak = -80; // リセット
+          currentPeak = 0;
         }, 1000);
 
         startBtn.style.display = 'none';
@@ -134,7 +131,7 @@
         player.src = URL.createObjectURL(audioBlob);
         player.style.display = 'block';
         chartContainer.style.display = 'block';
-        statusText.textContent = 'グラフの山をタップするとその瞬間にジャンプして再生します。';
+        statusText.textContent = 'グラフの山をタップすると該当秒数にジャンプして再生します。';
 
         stopBtn.style.display = 'none';
         startBtn.style.display = 'inline-block';
@@ -157,13 +154,14 @@
         data: {
           labels: labels,
           datasets: [{
-            label: '最大音量 (dB)',
+            label: '音量レベル',
             data: volumeHistory,
             borderColor: '#007aff',
-            backgroundColor: 'rgba(0, 122, 255, 0.15)',
+            backgroundColor: 'rgba(0, 122, 255, 0.25)',
             borderWidth: 2,
-            fill: true,
-            pointRadius: 2,
+            fill: 'start', // 下（0）から山に向かって塗りつぶす
+            tension: 0.2,
+            pointRadius: 3,
             pointHitRadius: 15
           }]
         },
@@ -171,7 +169,11 @@
           responsive: true,
           maintainAspectRatio: false,
           scales: {
-            y: { min: -80, max: 0, title: { display: true, text: '音量 (dB)' } }
+            y: { 
+              min: 0, 
+              max: 100, 
+              title: { display: true, text: '音の大きさ (0〜100)' } 
+            }
           },
           onClick: (evt, activeElements) => {
             if (activeElements.length > 0) {
